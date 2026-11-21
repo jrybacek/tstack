@@ -8,11 +8,16 @@ description: Monitor a pull request through review and CI. Use when the user ask
 Many repos have AI review bots. They're helpful, even if they are not always
 right.
 
+Works for GitHub and Azure DevOps PRs. Use the `pr-host` skill to detect the
+host and to find the command for each step below.
+
 ## Waiting
 
 Never write your own watcher, polling loop, or `sleep` loop. Use one watcher
-per PR: `watch_pull_request` in T3 Code, `pr-wait` everywhere else. Never run
-both on the same PR. Every watcher on a GitHub account shares one rate limit.
+per PR: `watch_pull_request` in T3 Code, `pr-wait` everywhere else. In T3 Code,
+use `pr-wait` only if `watch_pull_request` rejects the PR, for example an
+Azure DevOps PR. Never run both on the same PR. Every watcher on a GitHub
+account shares one rate limit.
 
 ### In T3 Code: `watch_pull_request`
 
@@ -38,21 +43,35 @@ branch conflicts.
 ### Everywhere else: `pr-wait`
 
 Wait with `scripts/pr-wait` from this skill's directory (use its absolute
-path).
+path). It is a Python script. On macOS and Linux run it directly. On Windows
+run `python <path>/pr-wait`.
 
 ```bash
-pr-wait <pr> [--repo owner/name] [--until ready|green|any-change]
+pr-wait <pr> [--repo REPO] [--until ready|green|any-change]
 ```
+
+`<pr>` is a number or a PR URL. Without `--repo`, it reads the host from the
+URL or from the `origin` remote. `REPO` is `owner/name` on GitHub and
+`org/project/repo` on Azure DevOps. GitHub needs a signed-in `gh`. Azure
+DevOps needs `az login`, or a PAT in `AZURE_DEVOPS_EXT_PAT`.
 
 It prints one line per real event. It exits 0 when the `--until` condition is
 met or the PR merges, 1 when it needs you (a required check failed, conflicts,
 unresolved threads, PR closed), and 2 on bad input.
 
 - `ready` (default): required checks green, Greptile or Macroscope reviewed the
-  head, and no unresolved threads. Use this to babysit.
-- `green`: required checks only. Use it when the repo has no Greptile or
-  Macroscope.
+  head, and no unresolved threads. Use this to babysit. On Azure DevOps it
+  waits for a review bot only if one has posted on the PR.
+- `green`: required checks only. Use it on GitHub when the repo has no
+  Greptile or Macroscope.
 - `any-change`: exit on the first event.
+
+On Azure DevOps, checks are blocking branch policies (build validation, status
+checks, work item linking), PR statuses for the latest push, and pipeline runs
+on the head commit. If a head has no checks at all for two minutes, `green`
+passes. A manual build policy, or an automatic one still expired after 5
+minutes, exits 1 with "needs action": queue it again (`pr-host` skill).
+`ready` also exits 1 while the branch is behind its base.
 
 In Claude Code, run it with the Monitor tool (`timeout_ms: 3600000`), so each
 line wakes you. Without a monitor, run it as one long command. It ends on its
@@ -67,6 +86,8 @@ With either watcher: when an event needs no action, end your turn without a
 message. Never post or say "still waiting".
 
 ## GitHub rate limits
+
+This section applies to GitHub only.
 
 `gh pr create`, `gh pr view`, and `gh pr checks` use GraphQL. When GraphQL is
 used up, the REST limit is separate and usually still has room. Use
@@ -87,8 +108,9 @@ CodeRabbit is advisory. Treat its findings like any other finding, but never
 wait for it and never hold a merge for it.
 
 If a review bot leaves feedback you believe is not worth addressing, reply with
-a written reason and resolve the comment. Use the `leaving-pr-comments` skill
-for every comment posted on the user's behalf.
+a written reason and resolve the comment. On Azure DevOps, resolve a thread by
+setting its status: `Fixed` for a fix, `WontFix` for a dismissal. Use the
+`leaving-pr-comments` skill for every comment posted on the user's behalf.
 
 Screenshots and videos help as well, when you have a way to upload them.
 
@@ -104,7 +126,8 @@ narrows code.
 Keep an eye on changes to `main` and rebase when needed. `pr-wait` reports when
 new base commits touch this PR's files, and when the PR becomes BEHIND or DIRTY.
 `watch_pull_request` reports conflicts only, so check for BEHIND yourself
-before you call the PR ready.
+before you call the PR ready. Azure DevOps has no BEHIND state: `pr-wait`
+counts the commits itself, and `ready` exits 1 while the branch is behind.
 If an overlapping PR makes this one obsolete, stop monitoring, report it to the
 user, and ask before closing the PR unless closure was explicitly authorized.
 
@@ -112,6 +135,7 @@ If nothing has changed, stay quiet rather than posting filler comments. Stop
 when `pr-wait` exits 0, or in T3 Code when the merge gate passes on the latest
 head. Merge only when the user explicitly requested it;
 otherwise report that the PR is ready. Right before a merge, run `git fetch` and
-check the PR again. Never merge when it is BEHIND or DIRTY, or when base commits
+check the PR again. Never merge when it is BEHIND or DIRTY (on Azure DevOps:
+behind its base or in conflict), or when base commits
 that landed after the last green run touch this PR's files. Rebase, push, and
 wait for green again.

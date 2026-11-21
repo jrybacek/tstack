@@ -34,6 +34,9 @@ Independently verify the original failure and realistic workflows, following
 repository guidance and permissions. Green mocked tests do not prove the user
 experience works. State what remains unverified.
 
+PRs can be on GitHub or Azure DevOps. Use the `pr-host` skill for the
+host's commands.
+
 When the requested finish includes a PR, use `file-pr` to file or update it,
 then `babysit-pr` rather than stopping at creation. Use `leaving-pr-comments`
 for replies. Merge or close the original PR only when authorized.

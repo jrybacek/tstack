@@ -19,11 +19,13 @@ permission does not apply. The overrides below take precedence.
 ## No merging
 
 You may commit, push, rebase, fix conflicts, and use `--force-with-lease` on
-this task's branch. Never merge, enable auto-merge, enter a merge queue, push
-to the default branch, bypass branch protection, or delegate those actions.
+this task's branch. Never merge (on Azure DevOps: complete), enable auto-merge
+or auto-complete, enter a merge queue, push to the default branch, bypass
+branch protection or branch policies, or delegate those actions.
 
-Disable existing auto-merge and remove the PR from any merge queue before
-work begins; check again before each push. Report these changes. If you
+Disable existing auto-merge or auto-complete and remove the PR from any merge
+queue before work begins; check again before each push. The `pr-host` skill
+has the commands for each host. Report these changes. If you
 cannot prevent automatic merging, report the blocker before proceeding.
 
 ## Stop at the gate

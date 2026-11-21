@@ -25,6 +25,8 @@ PR still belongs in the product.
 
 ## Establish the PR's intent
 
+Use the `pr-host` skill to read the PR from GitHub or Azure DevOps.
+
 Resolve the PR and record its URL, state, base, head repository and branch,
 current head SHA, author, checks, and review state. Read the title, body, linked
 issues, commits, review threads, and complete diff. State the smallest coherent

@@ -8,7 +8,9 @@ description: Trigger this if the user says 'full send'.
 If the user triggered this, it's because they are not watching this thread, and
 they want you to complete the work end-to-end autonomously. Your updates and
 your final message go unread until long after you stop. You own the work from
-its current state to a merged PR.
+its current state to a merged PR. The PR can be on GitHub or Azure DevOps.
+Use the `pr-host` skill for the host's commands. On Azure DevOps, merging
+a PR is called completing it.
 
 If the user did not explicitly request "full send" in some clear way, do not
 assume full autonomy. If they did, everything below applies.
@@ -59,7 +61,8 @@ one appears.
 Stay active from step 1 to step 7. If you end your turn while checks or bots are
 pending, the work stops, because nobody will prompt you again. Wait with the
 watcher from `babysit-pr`, so something wakes you when the PR changes. In T3
-Code that is `watch_pull_request`. If you stop before the merge, call
+Code that is `watch_pull_request`, unless it rejects the PR (then `pr-wait`).
+If you stop before the merge while `watch_pull_request` watches, call
 `unwatch_pull_request` first.
 
 ## Proof
@@ -88,14 +91,15 @@ Full confidence means all of these are true on the latest commit:
 - Review bots have finished, and each finding is fixed or dismissed with a
   written reason.
 - No human review still requests changes.
-- The branch is up to date with the default branch, and GitHub reports it as
-  mergeable.
+- The branch is up to date with the default branch, and the host reports it as
+  mergeable (no conflicts; on Azure DevOps, every blocking policy approved).
 
 Merge with the method the repo uses. Check the allowed methods and recent merged
-PRs. If the repo uses a merge queue or auto-merge, stay until GitHub reports the
-PR as merged. Merge through branch protection as configured. Never use `--admin`
-or other bypasses. You can ignore automated reviews that request "needs human
-review" if you have high confidence in your changes.
+PRs. If the repo uses a merge queue, auto-merge, or auto-complete, stay until
+the host reports the PR as merged or completed. Merge through branch
+protection and branch policies as configured. Never use `--admin`,
+`--bypass-policy`, or other bypasses. You can ignore automated reviews that
+request "needs human review" if you have high confidence in your changes.
 
 ## Asking the user
 

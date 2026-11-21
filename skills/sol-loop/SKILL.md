@@ -32,7 +32,11 @@ Otherwise stop and ask.
 
 Find the base after `git fetch origin`:
 
-- PR: `gh pr view <n> --json baseRefName,headRefOid`. Check out the branch
+- PR: read the base branch and head commit from the host (`pr-host` skill).
+  On GitHub: `gh pr view <n> --json baseRefName,headRefOid`. On Azure DevOps:
+  `az repos pr show --id <n> --query "[targetRefName, lastMergeSourceCommit.commitId]"`,
+  then strip `refs/heads/` from the target to get `<baseRefName>`.
+  Check out the branch
   only if clean. Confirm `HEAD` is the PR head, or ahead only by this
   change. Base: `git merge-base HEAD origin/<baseRefName>`.
 - Local: `git merge-base HEAD origin/<default-branch>`. No remote: a base
