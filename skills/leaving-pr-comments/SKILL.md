@@ -1,12 +1,12 @@
 ---
 name: leaving-pr-comments
-description: Use whenever leaving comments on GitHub.
+description: Use whenever leaving comments on GitHub or Azure DevOps pull requests.
 ---
 
 # Leaving PR Comments
 
-Prefix every agent-authored comment left on the user's behalf with this GitHub
-note callout:
+Prefix every agent-authored comment left on the user's behalf with an
+attribution note. On GitHub, use this note callout:
 
 ```md
 > [!NOTE]
@@ -15,8 +15,18 @@ note callout:
 Actual comment starts here.
 ```
 
+Azure DevOps does not render callouts, so use a plain quote there:
+
+```md
+> 🤖 **<model> responding on behalf of <user>**
+
+Actual comment starts here.
+```
+
+Use the `pr-host` skill if you are not sure which host the PR is on.
+
 Use the verified public name of the model that wrote the comment, and the
-user's name or GitHub login.
+user's name or login.
 
 If the harness does not expose a model name, use the harness name. Do not guess.
 
@@ -40,5 +50,6 @@ Write the comment itself in a direct style:
 - Distinguish verified facts from judgment.
 
 Preview the final Markdown before posting so quoting and blank lines render as
-shown. After posting, verify that GitHub returned the comment or review URL.
-Resolve a review thread only after its response was posted successfully.
+shown. After posting, verify that the host returned the comment, review, or
+thread. Resolve a review thread only after its response was posted
+successfully. On Azure DevOps, resolving means setting the thread status.

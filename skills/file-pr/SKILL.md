@@ -5,6 +5,9 @@ description: File a concise pull request. Use when the user asks to file, open, 
 
 # File PR
 
+Use the `pr-host` skill to find out whether the repo is on GitHub or Azure
+DevOps, and for the commands to use there.
+
 Before filing, check whether a PR for this branch already exists. Review the
 diff locally against the base branch (usually `origin/main`) to make sure its
 contents match the goal.
@@ -41,10 +44,16 @@ If model identity is unavailable, name the harness without guessing a model.
 Before submission, check the title, description, quotes, and attachments for
 secrets and private details.
 
-Open a real PR rather than a draft so review bots run. If `gh pr create` fails
-because the GraphQL rate limit is used up, open it through REST with
-`gh api repos/<owner>/<repo>/pulls -f title=... -f head=... -f base=... -F body=@<file>`. If the user also asked
-to babysit it, continue with the `babysit-pr` skill.
+Open a real PR rather than a draft so review bots and build policies run.
+
+- **GitHub:** if `gh pr create` fails because the GraphQL rate limit is used
+  up, open it through REST with
+  `gh api repos/<owner>/<repo>/pulls -f title=... -f head=... -f base=... -F body=@<file>`.
+- **Azure DevOps:** keep the description under 4000 characters. Link the work
+  item if the branch name, commits, or user name one (for example, a branch
+  named `task-123-...` links work item 123).
+
+If the user also asked to babysit it, continue with the `babysit-pr` skill.
 
 Do not post a follow-up PR comment unless it serves the user's request. When a
 comment is needed, use the `leaving-pr-comments` skill.

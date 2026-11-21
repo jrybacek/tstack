@@ -52,6 +52,7 @@ Rounds: 2
 
 If a delegate gives no score, write `no score`. Do not invent one.
 If the PR is open, edit the description. Do not post a comment for this.
+On Azure DevOps, the description must stay under 4000 characters.
 If there is no PR, put the same results in the final reply only.
 
 If you agree with their recommendations, make the changes and request a fresh

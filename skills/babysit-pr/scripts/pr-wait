@@ -1,41 +1,59 @@
 #!/usr/bin/env python3
-"""pr-wait: watch one GitHub pull request and print one line per real event.
+"""pr-wait: watch one pull request and print one line per real event.
 
-  pr-wait <pr> [--repo owner/name] [--until green|ready|any-change] [--interval 20]
+  pr-wait <pr> [--repo REPO] [--until green|ready|any-change] [--interval 20]
 
-<pr> is a PR number or PR URL. Without --repo, the repo comes from the URL or
-from the current checkout. Stdout carries only events, one line each, so a
-monitor (Claude Code's Monitor tool) wakes the agent once per real event.
-Progress and errors that do not end the run go to stderr.
+Works with GitHub and Azure DevOps. <pr> is a PR number or PR URL. Without
+--repo, the repo comes from the URL or from the current checkout's origin
+remote. REPO is owner/name for GitHub, or org/project/repo (or a repo URL) for
+Azure DevOps. Stdout carries only events, one line each, so a monitor (Claude
+Code's Monitor tool) wakes the agent once per real event. Progress and errors
+that do not end the run go to stderr.
 
 --until
   green       required checks passed on the current head (every CI check when
               the base branch requires none)
-  ready      green, Greptile or Macroscope reviewed the current head, and no
-              review thread is unresolved (default)
+  ready       green, no review thread is unresolved, and the review bot
+              reviewed the current head (default). On GitHub that bot is
+              Greptile or Macroscope and is required. On Azure DevOps it is
+              waited on only if one has posted on the PR, and the branch must
+              not be behind its base.
   any-change  stop after the first poll that prints an event
 
 Exit codes
   0  the --until condition is met, or the PR merged
-  1  the condition cannot be met without action: a required check failed, the
-     branch conflicts with its base, the PR closed, `ready` is blocked by
-     unresolved threads or a BEHIND branch, or GitHub stayed unreachable
+  1  the condition cannot be met without action: a required check failed or
+     needs to be queued again, the branch conflicts with its base, the PR
+     closed, `ready` is blocked by unresolved threads or a branch behind its
+     base, or the host stayed unreachable
   2  bad arguments, unknown PR, or another pr-wait already watches this PR
 
 Events
   - a required check failed (name and link)
   - all checks finished on the head (one summary line)
-  - a new comment, review, thread, or thread reply from someone other than the
-    PR author or the gh user
+  - a new comment, review or vote, thread, or thread reply from someone other
+    than the PR author or the signed-in user
   - Greptile, Macroscope, or CodeRabbit finished on the head, or a Greptile or
     Macroscope summary changed after that
   - the base branch moved and the new commits touch files in this PR
-  - merge state became BEHIND or DIRTY
-  - the PR merged or closed
+  - merge state became BEHIND (GitHub) or DIRTY (conflicts, both hosts)
+  - the PR merged (completed) or closed (abandoned)
+
+Checks on Azure DevOps are branch policies (build validation, status checks,
+work item linking), PR statuses, and pipeline runs on the source branch for the
+head commit. Blocking policies are the required checks. Reviewer and comment
+policies are not checks: votes and threads cover them. Statuses from earlier
+pushes are ignored. When an Azure DevOps head has had no checks at all for two
+minutes, `green` counts as met.
+
+Auth: GitHub uses `gh`. Azure DevOps uses AZURE_DEVOPS_EXT_PAT or
+AZURE_DEVOPS_PAT (a PAT), SYSTEM_ACCESSTOKEN (in a pipeline), or else a token
+from `az account get-access-token`.
 
 CodeRabbit is advisory: pr-wait reports it but never waits for it. Comment
 edits are never events, and top-level comments from CI and deploy bots
-(github-actions, Vercel) are skipped, because checks already carry that news.
+(github-actions, Vercel, Azure Pipelines build service) are skipped, because
+checks already carry that news.
 
 State lives in ~/.local/state/pr-wait/. A lock makes a second watcher for the
 same PR exit at once. A state file lets a restarted watcher report what arrived
@@ -46,15 +64,19 @@ reports only what comes after.
 from __future__ import annotations
 
 import argparse
-import fcntl
+import base64
 import hashlib
 import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, NoReturn
@@ -62,49 +84,31 @@ from typing import Any, NoReturn
 GATING_BOTS = ("greptile", "macroscope")
 ADVISORY_BOTS = ("coderabbit",)
 # CI and deploy bots report through checks. Their PR comments are status reports.
-STATUS_BOTS = ("github-actions", "vercel", "netlify", "railway", "cloudflare")
+STATUS_BOTS = ("github-actions", "vercel", "netlify", "railway", "cloudflare", "build service")
 STATE_DIR = Path.home() / ".local" / "state" / "pr-wait"
 # A state file older than this describes an old session. Start a fresh baseline
 # instead of replaying hours of comments as new events.
 STALE_STATE_SECONDS = 6 * 3600
 MAX_FAILED_POLLS = 10
+# An Azure DevOps head without any checks counts as green after this long.
+NO_CHECK_SECONDS = 120
+# Azure DevOps queues an expired automatic build policy again by itself. If it
+# has not after this long, the agent has to.
+EXPIRED_GRACE_SECONDS = 300
 TRANSIENT = re.compile(
     r"HTTP (5\d\d|429)|rate limit|timed? ?out|connection (reset|refused)|EOF|"
     r"temporar|could not resolve host|TLS handshake|Something went wrong",
     re.IGNORECASE,
 )
 FAILED = ("fail", "cancel")
-# gh pr checks buckets, worst first. Duplicate names (push and pull_request runs
-# of one job) collapse to the worst bucket.
+# Check buckets, worst first. Duplicate names (push and pull_request runs of
+# one job) collapse to the worst bucket.
 RANK = {"fail": 4, "cancel": 3, "pending": 2, "pass": 1, "skipping": 0}
-
-QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
-  viewer { login }
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      url state headRefOid baseRefName mergeStateStatus
-      author { login }
-      baseRef { target { oid } }
-      comments(last: 100) { nodes { id url body author { login __typename } } }
-      reviews(last: 100) {
-        nodes { id url state body commit { oid } author { login __typename } }
-      }
-      reviewThreads(last: 100) {
-        nodes {
-          isResolved path line
-          comments(first: 100) { nodes { id url body author { login __typename } } }
-        }
-      }
-    }
-  }
-}
-"""
 
 Json = dict[str, Any]
 
 
-class GhError(Exception):
+class HostError(Exception):
     def __init__(self, message: str, transient: bool) -> None:
         super().__init__(message)
         self.transient = transient
@@ -120,37 +124,14 @@ def fail(message: str, code: int = 2) -> NoReturn:
     sys.exit(code)
 
 
-def gh(args: list[str], allow: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[str]:
-    """Run gh. Retries transient failures (HTTP 5xx or 429, network) with backoff."""
-    delay = 2
-    for attempt in range(5):
-        proc = subprocess.run(["gh", *args], capture_output=True, text=True)
-        transient = proc.returncode != 0 and bool(TRANSIENT.search(proc.stderr))
-        if not transient and proc.returncode in allow:
-            return proc
-        lines = proc.stderr.strip().splitlines()
-        message = lines[-1] if lines else f"gh exited {proc.returncode}"
-        if not transient or attempt == 4:
-            raise GhError(message, transient)
-        log(f"gh {' '.join(args[:2])}: {message}; retry in {delay}s")
-        time.sleep(delay)
-        delay *= 2
-    raise AssertionError("unreachable")
-
-
-def gh_lines(args: list[str]) -> list[str]:
-    return [line for line in gh(args).stdout.splitlines() if line]
+def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 def bot_name(text: str | None) -> str | None:
     """Which review bot a login or check name belongs to, if any."""
     lowered = (text or "").lower()
     return next((bot for bot in GATING_BOTS + ADVISORY_BOTS if bot in lowered), None)
-
-
-def who(node: Json) -> tuple[str, bool]:
-    author = node.get("author") or {}
-    return author.get("login") or "ghost", author.get("__typename") == "Bot"
 
 
 def plain(body: str) -> str:
@@ -175,81 +156,627 @@ def digest(body: str) -> str:
     return hashlib.sha1(re.sub(r"\s+", " ", plain(body)).encode()).hexdigest()[:12]
 
 
-def parse_target(raw: str | None, repo: str | None) -> tuple[str, int]:
+# A snapshot is one poll of a PR in a host-neutral shape:
+#   url, state (OPEN|MERGED|CLOSED), head, base, base_oid, merge_state, mine
+#   comments: top-level comments      [{id, url, body, who, login, is_bot}]
+#   posts:    where bot summaries live (same shape)
+#   reviews:  reviews or votes        [{id, url, state, body, commit, who, login, is_bot}]
+#   threads:  [{resolved, path, line, comments: [...]}]
+#   checks:   {name: {bucket, link, description}}, required: set of names
+#   notes:    extra summary parts
+
+
+# --------------------------------------------------------------------- GitHub
+
+QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      url state headRefOid baseRefName mergeStateStatus
+      author { login }
+      baseRef { target { oid } }
+      comments(last: 100) { nodes { id url body author { login __typename } } }
+      reviews(last: 100) {
+        nodes { id url state body commit { oid } author { login __typename } }
+      }
+      reviewThreads(last: 100) {
+        nodes {
+          isResolved path line
+          comments(first: 100) { nodes { id url body author { login __typename } } }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def gh(args: list[str], allow: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[str]:
+    """Run gh. Retries transient failures (HTTP 5xx or 429, network) with backoff."""
+    delay = 2
+    for attempt in range(5):
+        proc = run(["gh", *args])
+        transient = proc.returncode != 0 and bool(TRANSIENT.search(proc.stderr))
+        if not transient and proc.returncode in allow:
+            return proc
+        lines = proc.stderr.strip().splitlines()
+        message = lines[-1] if lines else f"gh exited {proc.returncode}"
+        if not transient or attempt == 4:
+            raise HostError(message, transient)
+        log(f"gh {' '.join(args[:2])}: {message}; retry in {delay}s")
+        time.sleep(delay)
+        delay *= 2
+    raise AssertionError("unreachable")
+
+
+def gh_lines(args: list[str]) -> list[str]:
+    return [line for line in gh(args).stdout.splitlines() if line]
+
+
+def gh_person(node: Json) -> Json:
+    author = node.get("author") or {}
+    login = author.get("login") or "ghost"
+    return {"who": login, "login": login, "is_bot": author.get("__typename") == "Bot"}
+
+
+class GitHub:
+    label = "GitHub"
+    review_bot_required = True
+    allow_no_checks = False
+    reports_behind = True  # mergeStateStatus says BEHIND when it matters
+
+    def __init__(self, repo: str, pr: int) -> None:
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+            fail(f"'{repo}' is not owner/name")
+        self.repo, self.pr = repo, pr
+        self.owner, self.name = repo.split("/")
+        self.key = repo
+        self.required: set[str] | None = None
+        self.files: dict[str, set[str]] = {}
+
+    def check_exists(self) -> None:
+        try:
+            gh(["pr", "view", str(self.pr), "-R", self.repo, "--json", "number"])
+        except HostError as error:
+            if not error.transient:  # a transient failure is retried by the poll loop
+                fail(f"cannot read {self.repo}#{self.pr}: {error}")
+
+    def required_checks(self, base: str) -> set[str]:
+        """Required check names for the base branch, from rulesets and classic branch
+        protection. Knowing them up front means a required check that has not started
+        yet counts as pending, instead of green by omission."""
+        sources = (
+            (
+                f"repos/{self.repo}/rules/branches/{base}",
+                '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context',
+            ),
+            (f"repos/{self.repo}/branches/{base}/protection/required_status_checks", ".contexts[]?, .checks[]?.context"),
+        )
+        names: set[str] = set()
+        for path, jq in sources:
+            try:
+                names.update(gh_lines(["api", path, "--jq", jq]))
+            except HostError as error:
+                if "HTTP 404" not in str(error):  # 404 means no protection, which is normal
+                    log(f"could not read required checks from {path}: {error}")
+        return names
+
+    def checks(self) -> dict[str, Json]:
+        # gh pr checks exits 8 while checks are pending and 1 when one failed.
+        # Those are states, not errors: read the JSON and ignore the exit code.
+        proc = gh(["pr", "checks", str(self.pr), "-R", self.repo, "--json", "name,bucket,link,description"], allow=(0, 1, 8))
+        if not proc.stdout.strip():
+            if "no checks reported" in proc.stderr:
+                return {}
+            raise HostError(proc.stderr.strip() or f"gh pr checks exited {proc.returncode}", False)
+        checks: dict[str, Json] = {}
+        for row in json.loads(proc.stdout):
+            current = checks.get(row["name"])
+            if current is None or RANK.get(row["bucket"], 2) > RANK.get(current["bucket"], 2):
+                checks[row["name"]] = row
+        return checks
+
+    def snapshot(self) -> Json:
+        proc = gh([
+            "api", "graphql", "-f", f"query={QUERY}",
+            "-f", f"owner={self.owner}", "-f", f"name={self.name}", "-F", f"number={self.pr}",
+        ])
+        data = json.loads(proc.stdout)["data"]
+        pr = data["repository"]["pullRequest"]
+        if self.required is None:
+            self.required = self.required_checks(pr["baseRefName"])
+
+        def comment(node: Json) -> Json:
+            return {"id": node["id"], "url": node["url"], "body": node["body"] or "", **gh_person(node)}
+
+        comments = [comment(c) for c in pr["comments"]["nodes"]]
+        return {
+            "url": pr["url"],
+            "state": pr["state"],
+            "head": pr["headRefOid"],
+            "base": pr["baseRefName"],
+            "base_oid": ((pr.get("baseRef") or {}).get("target") or {}).get("oid"),
+            "merge_state": pr["mergeStateStatus"],
+            "mine": {gh_person(pr)["who"], data["viewer"]["login"]},
+            "comments": comments,
+            "posts": comments,
+            "reviews": [
+                {
+                    "id": r["id"], "url": r["url"], "state": r["state"], "body": r["body"] or "",
+                    "commit": (r.get("commit") or {}).get("oid"), **gh_person(r),
+                }
+                for r in pr["reviews"]["nodes"]
+            ],
+            "threads": [
+                {
+                    "resolved": t["isResolved"], "path": t["path"], "line": t["line"],
+                    "comments": [comment(c) for c in t["comments"]["nodes"]],
+                }
+                for t in pr["reviewThreads"]["nodes"]
+            ],
+            "checks": self.checks(),
+            "required": self.required,
+            "notes": [],
+        }
+
+    def pr_files(self, head: str) -> set[str]:
+        if head not in self.files:
+            self.files[head] = set(gh_lines(["pr", "diff", str(self.pr), "-R", self.repo, "--name-only"]))
+        return self.files[head]
+
+    def changed(self, old: str, new: str) -> set[str]:
+        return set(gh_lines(["api", f"repos/{self.repo}/compare/{old}...{new}", "--jq", ".files[].filename"]))
+
+    def behind_by(self, base_oid: str, head: str) -> str:
+        return gh(["api", f"repos/{self.repo}/compare/{base_oid}...{head}", "--jq", ".behind_by"]).stdout.strip()
+
+
+# --------------------------------------------------------------- Azure DevOps
+
+ADO_RESOURCE = "499b84ac-1321-427f-aa17-267ca6975798"  # Azure DevOps app ID for az tokens
+# Policy types that are not checks. Votes and threads already report them.
+NOT_CHECKS = {
+    "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd": "minimum reviewers",
+    "fd2167ab-b0be-447a-8ec8-39368250530e": "required reviewers",
+    "c6a1889d-b943-4856-b76f-9e46bb6b0df2": "comment requirements",
+    "fa4e907d-c16b-4a4c-9dfa-4916e5d171ab": "merge strategy",
+}
+REVIEWER_POLICIES = ("minimum reviewers", "required reviewers")
+POLICY_BUCKET = {"approved": "pass", "notApplicable": "skipping", "rejected": "fail", "broken": "fail"}
+STATUS_BUCKET = {"succeeded": "pass", "notApplicable": "skipping", "failed": "fail", "error": "fail"}
+BUILD_BUCKET = {"succeeded": "pass", "partiallySucceeded": "fail", "failed": "fail", "canceled": "cancel"}
+BOT_ACCOUNT = re.compile(r"build service|\[bot\]|\bbot\b", re.IGNORECASE)
+
+ADO_PR_URL = re.compile(
+    r"https?://(?:[^@/\s]+@)?(?:dev\.azure\.com/(?P<org>[^/\s]+)|(?P<vsorg>[^./\s]+)\.visualstudio\.com(?:/DefaultCollection)?)"
+    r"(?:/(?P<project>[^/\s]+))?/_git/(?P<repo>[^/\s?#]+)/pullrequest/(?P<pr>\d+)(?:[/?#]\S*)?",
+    re.IGNORECASE,
+)
+ADO_REPO_URL = re.compile(
+    r"https?://(?:[^@/\s]+@)?(?:dev\.azure\.com/(?P<org>[^/\s]+)|(?P<vsorg>[^./\s]+)\.visualstudio\.com(?:/DefaultCollection)?)"
+    r"(?:/(?P<project>[^/\s]+))?/_git/(?P<repo>[^/\s?#]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+ADO_SSH = re.compile(
+    r"(?:[^@\s]+@)?(?:ssh\.dev\.azure\.com|vs-ssh\.visualstudio\.com):v3/(?P<org>[^/\s]+)/(?P<project>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+
+def ado_parts(match: re.Match[str]) -> tuple[str, str, str]:
+    groups = match.groupdict()
+    org = groups.get("org") or groups.get("vsorg")
+    org_url = f"https://dev.azure.com/{org}" if groups.get("org") else f"https://{org}.visualstudio.com"
+    unquote = urllib.parse.unquote
+    # dev.azure.com/<org>/_git/<repo> means the project has the repo's name.
+    return org_url, unquote(groups.get("project") or groups["repo"]), unquote(groups["repo"])
+
+
+class AzureDevOps:
+    label = "Azure DevOps"
+    review_bot_required = False
+    allow_no_checks = True
+    reports_behind = False  # no BEHIND state: the watcher counts commits itself
+
+    def __init__(self, org_url: str, project: str, repo: str, pr: int) -> None:
+        self.org, self.project, self.repo, self.pr = org_url.rstrip("/"), project, repo, pr
+        quote = lambda s: urllib.parse.quote(s, safe="")  # noqa: E731
+        self.proj_url = f"{self.org}/{quote(project)}"
+        self.repo_url = f"{self.proj_url}/_apis/git/repositories/{quote(repo)}"
+        self.web_url = f"{self.proj_url}/_git/{quote(repo)}/pullrequest/{pr}"
+        self.key = f"{self.org.split('//')[-1]}/{project}/{repo}"
+        self.token: str | None = None
+        self.token_at = 0.0
+        self.me: str | None = None
+        self.files: dict[str, set[str]] = {}
+        self.expired_seen: dict[tuple[str, Any], float] = {}
+
+    # Auth and HTTP
+
+    def auth(self, refresh: bool = False) -> str:
+        pat = os.environ.get("AZURE_DEVOPS_EXT_PAT") or os.environ.get("AZURE_DEVOPS_PAT")
+        if pat:
+            return "Basic " + base64.b64encode(f":{pat}".encode()).decode()
+        if os.environ.get("SYSTEM_ACCESSTOKEN"):
+            return "Bearer " + os.environ["SYSTEM_ACCESSTOKEN"]
+        # az tokens last about an hour. Refresh well before that.
+        if refresh or not self.token or time.time() - self.token_at > 40 * 60:
+            az = shutil.which("az")
+            if not az:
+                raise HostError("no AZURE_DEVOPS_EXT_PAT and no Azure CLI (az) to get a token", False)
+            proc = run([az, "account", "get-access-token", "--resource", ADO_RESOURCE, "--query", "accessToken", "-o", "tsv"])
+            if proc.returncode != 0 or not proc.stdout.strip():
+                lines = proc.stderr.strip().splitlines()
+                raise HostError(f"az could not get a token ({lines[-1] if lines else 'no output'}); run `az login`", False)
+            self.token, self.token_at = proc.stdout.strip(), time.time()
+        return "Bearer " + self.token
+
+    def get(self, url: str, **params: Any) -> Json:
+        params.setdefault("api-version", "7.1")
+        full = f"{url}{'&' if '?' in url else '?'}{urllib.parse.urlencode(params)}"
+        where = url.split("/_apis/")[-1]
+        delay = 2
+        refreshed = False
+        for attempt in range(5):
+            headers = {
+                "Authorization": self.auth(refreshed),
+                "Accept": "application/json",
+                # Without this, a bad token gets a sign-in page (HTTP 203), not a 401.
+                "X-TFS-FedAuthRedirect": "Suppress",
+            }
+            network_error = ""
+            try:
+                with urllib.request.urlopen(urllib.request.Request(full, headers=headers), timeout=60) as response:
+                    status, body = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                status = error.code
+                try:
+                    body = error.read()
+                except OSError:
+                    body = b""
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+                status, body, network_error = 0, b"", f"{type(error).__name__}: {error}"
+            if status in (401, 203):
+                if not refreshed:
+                    refreshed = True
+                    continue
+                raise HostError(
+                    f"Azure DevOps rejected the sign-in (HTTP {status}); run `az login` or check AZURE_DEVOPS_EXT_PAT", False
+                )
+            if 200 <= status < 300:
+                try:
+                    return json.loads(body.decode("utf-8"))
+                except ValueError:
+                    raise HostError(f"{where} did not return JSON; check the Azure DevOps sign-in", False) from None
+            transient = status in (0, 429) or status >= 500
+            detail = ""
+            try:  # Azure DevOps explains most errors in a JSON "message" (TF... codes)
+                detail = str(json.loads(body.decode("utf-8")).get("message") or "")[:200]
+            except (ValueError, AttributeError):
+                pass
+            message = network_error or f"HTTP {status} from {where}" + (f": {detail}" if detail else "")
+            if status == 404:
+                message += " (not found, or no access)"
+            if not transient or attempt == 4:
+                raise HostError(message, transient)
+            log(f"{message}; retry in {delay}s")
+            time.sleep(delay)
+            delay *= 2
+        raise AssertionError("unreachable")
+
+    # Reads
+
+    def check_exists(self) -> None:
+        try:
+            self.get(f"{self.repo_url}/pullrequests/{self.pr}")
+        except HostError as error:
+            if not error.transient:
+                fail(f"cannot read {self.project}/{self.repo}!{self.pr}: {error}")
+
+    def person(self, identity: Json | None) -> Json:
+        identity = identity or {}
+        name = identity.get("displayName") or identity.get("uniqueName") or "unknown"
+        return {"who": identity.get("id") or name, "login": name, "is_bot": bool(BOT_ACCOUNT.search(name))}
+
+    def checks(self, pr: Json, head: str) -> tuple[dict[str, Json], set[str], list[str]]:
+        checks: dict[str, Json] = {}
+        required: set[str] = set()
+        approvals: list[str] = []
+        policy_builds: set[int] = set()
+        artifact = f"vstfs:///CodeReview/CodeReviewId/{pr['repository']['project']['id']}/{self.pr}"
+        evaluations = self.get(f"{self.proj_url}/_apis/policy/evaluations", artifactId=artifact, **{"api-version": "7.1-preview.1"})
+        for ev in evaluations.get("value", []):
+            config = ev.get("configuration") or {}
+            if not config.get("isEnabled", True):
+                continue
+            kind = (config.get("type") or {})
+            settings = config.get("settings") or {}
+            context = ev.get("context") or {}
+            status = ev.get("status", "queued")
+            special = NOT_CHECKS.get(kind.get("id", ""))
+            if special in REVIEWER_POLICIES:
+                approvals.append(status)
+            if special:
+                continue
+            if settings.get("statusName"):
+                name = "/".join(filter(None, [settings.get("statusGenre"), settings["statusName"]]))
+            elif settings.get("buildDefinitionId") and not settings.get("displayName"):
+                name = f"build definition {settings['buildDefinitionId']}"
+            else:
+                name = settings.get("displayName") or kind.get("displayName") or "policy"
+            while name in checks:
+                name += "'"
+            bucket = POLICY_BUCKET.get(status, "pending")
+            description = status
+            action = ""
+            if context.get("isExpired"):
+                # Expiry is not a failure. Automatic policies queue a new build
+                # themselves; manual ones wait for someone to queue it.
+                bucket = "pending"
+                if settings.get("manualQueueOnly"):
+                    action = "expired, queue the build again"
+                else:
+                    first = self.expired_seen.setdefault((name, context.get("buildId")), time.time())
+                    if time.time() - first >= EXPIRED_GRACE_SECONDS:
+                        action = "expired and not queued again after 5 minutes, queue the build"
+                    else:
+                        description = "expired, waiting for the automatic rebuild"
+            elif status == "queued" and settings.get("manualQueueOnly") and not context.get("buildId"):
+                action = "manual build, queue it"
+            link = self.web_url
+            if context.get("buildId"):
+                policy_builds.add(int(context["buildId"]))
+                link = f"{self.proj_url}/_build/results?buildId={context['buildId']}"
+            checks[name] = {"name": name, "bucket": bucket, "link": link, "description": action or description, "action": action}
+            if config.get("isBlocking"):
+                required.add(name)
+
+        # A status posted for an earlier push says nothing about this head.
+        current = self.latest_iteration()
+        latest: dict[str, Json] = {}
+        for status in self.get(f"{self.repo_url}/pullrequests/{self.pr}/statuses").get("value", []):
+            if status.get("iterationId") and current and status["iterationId"] < current:
+                continue
+            context = status.get("context") or {}
+            name = "/".join(filter(None, [context.get("genre"), context.get("name")]))
+            if name and (name not in latest or status.get("id", 0) > latest[name].get("id", 0)):
+                latest[name] = status
+        for name, status in latest.items():
+            if name not in checks:
+                checks[name] = {
+                    "name": name, "bucket": STATUS_BUCKET.get(status.get("state", ""), "pending"),
+                    "link": status.get("targetUrl") or self.web_url, "description": status.get("description") or "",
+                }
+
+        # Pipelines that a branch trigger ran on the head commit. Repos without
+        # build validation policies report CI this way.
+        builds = self.get(
+            f"{self.proj_url}/_apis/build/builds",
+            branchName=pr["sourceRefName"], repositoryId=pr["repository"]["id"], repositoryType="TfsGit",
+            queryOrder="queueTimeDescending", **{"$top": 50},
+        )
+        seen: set[int] = set()
+        for build in builds.get("value", []):
+            definition = (build.get("definition") or {})
+            if build.get("sourceVersion") != head or build["id"] in policy_builds or definition.get("id") in seen:
+                continue
+            seen.add(definition.get("id"))
+            name = definition.get("name") or f"build {build['id']}"
+            if name in checks:
+                continue
+            done = build.get("status") == "completed"
+            checks[name] = {
+                "name": name, "bucket": BUILD_BUCKET.get(build.get("result", ""), "pending") if done else "pending",
+                "link": ((build.get("_links") or {}).get("web") or {}).get("href") or self.web_url,
+                "description": build.get("result") if done else build.get("status", ""),
+            }
+
+        notes: list[str] = []
+        if approvals:
+            state = "rejected" if "rejected" in approvals else "approved" if all(a == "approved" for a in approvals) else "pending"
+            notes.append(f"reviewer policy {state}")
+        return checks, required, notes
+
+    def snapshot(self) -> Json:
+        if self.me is None:
+            data = self.get(f"{self.org}/_apis/connectionData", **{"api-version": "7.1-preview.1"})
+            self.me = (data.get("authenticatedUser") or {}).get("id") or ""
+        pr = self.get(f"{self.repo_url}/pullrequests/{self.pr}")
+        head = (pr.get("lastMergeSourceCommit") or {}).get("commitId") or ""
+        base = pr["targetRefName"].removeprefix("refs/heads/")
+        base_oid = None
+        for ref in self.get(f"{self.repo_url}/refs", filter=f"heads/{base}").get("value", []):
+            if ref.get("name") == pr["targetRefName"]:
+                base_oid = ref.get("objectId")
+
+        state = {"completed": "MERGED", "abandoned": "CLOSED"}.get(pr.get("status", ""), "OPEN")
+        merge_status = pr.get("mergeStatus", "notSet")
+        merge_state = {"conflicts": "DIRTY", "succeeded": "CLEAN", "queued": "UNKNOWN", "notSet": "UNKNOWN"}.get(
+            merge_status, merge_status.upper()
+        )
+
+        threads: list[Json] = []
+        posts: list[Json] = []
+        for thread in self.get(f"{self.repo_url}/pullrequests/{self.pr}/threads").get("value", []):
+            if thread.get("isDeleted"):
+                continue
+            comments = [
+                {
+                    "id": f"t{thread['id']}c{c['id']}", "url": f"{self.web_url}?discussionId={thread['id']}",
+                    "body": c.get("content") or "", **self.person(c.get("author")),
+                }
+                for c in thread.get("comments", [])
+                if not c.get("isDeleted") and c.get("commentType", "text") == "text"
+            ]
+            if not comments:  # system threads: votes, pushes, policy notes
+                continue
+            context = thread.get("threadContext") or {}
+            line = ((context.get("rightFileStart") or context.get("leftFileStart")) or {}).get("line")
+            threads.append({
+                "resolved": thread.get("status") not in ("active", "pending"),
+                "path": (context.get("filePath") or "").lstrip("/"), "line": line, "comments": comments,
+            })
+            posts.append(comments[0])
+
+        reviews = []
+        votes = {10: "APPROVED", 5: "APPROVED", -5: "CHANGES_REQUESTED", -10: "CHANGES_REQUESTED"}
+        for reviewer in pr.get("reviewers", []):
+            vote = reviewer.get("vote", 0)
+            if vote and not reviewer.get("isContainer"):
+                reviews.append({
+                    "id": f"vote:{reviewer.get('id')}:{vote}", "url": self.web_url, "state": votes[vote],
+                    "body": {5: "approved with suggestions", -5: "waiting for author"}.get(vote, ""),
+                    "commit": None, **self.person(reviewer),
+                })
+
+        checks, required, notes = self.checks(pr, head)
+        if pr.get("isDraft"):
+            notes.append("draft")
+        if pr.get("autoCompleteSetBy"):
+            notes.append("auto-complete on")
+        return {
+            "url": self.web_url,
+            "state": state,
+            "head": head,
+            "base": base,
+            "base_oid": base_oid,
+            "merge_state": merge_state,
+            "mine": {self.person(pr.get("createdBy"))["who"], self.me},
+            "comments": [],
+            "posts": posts,
+            "reviews": reviews,
+            "threads": threads,
+            "checks": checks,
+            "required": required,
+            "notes": notes,
+        }
+
+    def diff_paths(self, base: str, target: str) -> set[str]:
+        data = self.get(
+            f"{self.repo_url}/diffs/commits",
+            baseVersion=base, baseVersionType="commit", targetVersion=target, targetVersionType="commit", **{"$top": 2000},
+        )
+        return {c["item"]["path"].lstrip("/") for c in data.get("changes", []) if not c["item"].get("isFolder")}
+
+    def latest_iteration(self) -> int:
+        iterations = self.get(f"{self.repo_url}/pullrequests/{self.pr}/iterations").get("value", [])
+        return max((it.get("id", 0) for it in iterations), default=0)
+
+    def pr_files(self, head: str) -> set[str]:
+        if head not in self.files:
+            last = self.latest_iteration() or 1
+            data = self.get(f"{self.repo_url}/pullrequests/{self.pr}/iterations/{last}/changes", **{"$top": 2000})
+            self.files[head] = {
+                (c.get("item") or {}).get("path", "").lstrip("/") for c in data.get("changeEntries", [])
+            } - {""}
+        return self.files[head]
+
+    def changed(self, old: str, new: str) -> set[str]:
+        return self.diff_paths(old, new)
+
+    def behind_by(self, base_oid: str, head: str) -> str:
+        # aheadCount is the number of commits in the target that the base lacks.
+        data = self.get(
+            f"{self.repo_url}/diffs/commits",
+            baseVersion=head, baseVersionType="commit", targetVersion=base_oid, targetVersionType="commit", **{"$top": 1},
+        )
+        if "aheadCount" not in data:
+            raise HostError("could not compare the branch with its base", True)
+        return str(data["aheadCount"])
+
+
+# -------------------------------------------------------------------- targets
+
+GITHUB_PR_URL = re.compile(r"https?://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)(?:[/?#]\S*)?")
+
+
+def origin_host(repo: str | None) -> GitHub | AzureDevOps | str | None:
+    """A host for --repo or the checkout's origin. Returns owner/name for GitHub."""
+    raw = repo
+    if raw is None:
+        proc = run(["git", "remote", "get-url", "origin"])
+        raw = proc.stdout.strip() if proc.returncode == 0 else ""
+    for pattern in (ADO_REPO_URL, ADO_SSH):
+        match = pattern.fullmatch(raw.strip())
+        if match:
+            return ado_parts(match)  # type: ignore[return-value]
+    if repo is not None:
+        parts = repo.strip("/").split("/")
+        if len(parts) == 3:  # org/project/repo
+            return (f"https://dev.azure.com/{parts[0]}", parts[1], parts[2])  # type: ignore[return-value]
+        return repo
+    # gh picks the base repo of a fork checkout (or `gh repo set-default`), so
+    # it decides for every remote that is not Azure DevOps.
+    try:
+        return gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]).stdout.strip()
+    except HostError as error:
+        fail(f"no --repo given and origin is neither a GitHub nor an Azure DevOps repo ({error})")
+
+
+def parse_target(raw: str | None, repo: str | None) -> GitHub | AzureDevOps:
     if raw is None or not raw.strip():
-        fail("missing PR number. Did a variable expand to nothing? Usage: pr-wait <pr> [--repo owner/name]")
-    url = re.fullmatch(r"https?://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)(?:[/?#]\S*)?", raw.strip())
-    number = re.fullmatch(r"#?(\d+)", raw.strip())
-    if url:
-        repo = repo or url.group(1)
-        pr = int(url.group(2))
+        fail("missing PR number. Did a variable expand to nothing? Usage: pr-wait <pr> [--repo REPO]")
+    raw = raw.strip()
+    github_url = GITHUB_PR_URL.fullmatch(raw)
+    ado_url = ADO_PR_URL.fullmatch(raw)
+    number = re.fullmatch(r"[#!]?(\d+)", raw)
+    if github_url:
+        target: Any = repo or github_url.group(1)
+        pr = int(github_url.group(2))
+        if repo:
+            target = origin_host(repo)
+    elif ado_url:
+        target = ado_parts(ado_url)
+        pr = int(ado_url.group("pr"))
     elif number:
         pr = int(number.group(1))
+        target = origin_host(repo)
     else:
         fail(f"'{raw}' is not a PR number or PR URL")
     if pr <= 0:
         fail(f"'{raw}' is not a valid PR number")
-    if not repo:
-        try:
-            repo = gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]).stdout.strip()
-        except GhError as error:
-            fail(f"no --repo given and the current directory has no GitHub repo ({error})")
-    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
-        fail(f"'{repo}' is not owner/name")
-    try:
-        gh(["pr", "view", str(pr), "-R", repo, "--json", "number"])
-    except GhError as error:
-        if not error.transient:  # a transient failure is retried by the poll loop
-            fail(f"cannot read {repo}#{pr}: {error}")
-    return repo, pr
+    host: GitHub | AzureDevOps = AzureDevOps(*target, pr) if isinstance(target, tuple) else GitHub(target, pr)
+    host.check_exists()
+    return host
 
 
-def lock(repo: str, pr: int) -> Any:
+def lock(key: str) -> Any:
     """Hold a per-PR lock for the life of the process. The OS drops it on exit."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    handle = open(STATE_DIR / f"{repo.replace('/', '__')}__{pr}.lock", "a+")
+    handle = open(STATE_DIR / f"{key}.lock", "a+")
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.seek(0)
-        pid = handle.read().strip() or "unknown"
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        pid = "unknown"
+        try:
+            pid = (STATE_DIR / f"{key}.pid").read_text().strip() or pid
+        except OSError:
+            pass
         fail(
-            f"pid {pid} already watches {repo}#{pr}, so this watcher exits to avoid "
-            f"duplicate events. If no events reach you from it, run `kill {pid}` and start again."
+            f"pid {pid} already watches this PR, so this watcher exits to avoid "
+            f"duplicate events. If no events reach you from it, stop pid {pid} and start again."
         )
-    handle.seek(0)
-    handle.truncate()
-    handle.write(str(os.getpid()))
-    handle.flush()
+    (STATE_DIR / f"{key}.pid").write_text(str(os.getpid()))
     return handle
 
 
-def required_checks(repo: str, base: str) -> set[str]:
-    """Required check names for the base branch, from rulesets and classic branch
-    protection. Knowing them up front means a required check that has not started
-    yet counts as pending, instead of green by omission."""
-    sources = (
-        (
-            f"repos/{repo}/rules/branches/{base}",
-            '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context',
-        ),
-        (f"repos/{repo}/branches/{base}/protection/required_status_checks", ".contexts[]?, .checks[]?.context"),
-    )
-    names: set[str] = set()
-    for path, jq in sources:
-        try:
-            names.update(gh_lines(["api", path, "--jq", jq]))
-        except GhError as error:
-            if "HTTP 404" not in str(error):  # 404 means no protection, which is normal
-                log(f"could not read required checks from {path}: {error}")
-    return names
+# -------------------------------------------------------------------- watcher
 
 
 class Watcher:
-    def __init__(self, repo: str, pr: int, until: str, interval: int) -> None:
-        self.repo, self.pr, self.until, self.interval = repo, pr, until, interval
-        self.owner, self.name = repo.split("/")
-        self.path = STATE_DIR / f"{repo.replace('/', '__')}__{pr}.json"
+    def __init__(self, host: GitHub | AzureDevOps, until: str, interval: int) -> None:
+        self.host, self.pr, self.until, self.interval = host, host.pr, until, interval
+        self.key = re.sub(r"[^\w.-]+", "__", host.key) + f"__{host.pr}"
+        self.path = STATE_DIR / f"{self.key}.json"
         state = self.load()
         # First run for this PR: record what exists and report nothing.
         self.baseline = state is None
@@ -257,9 +784,9 @@ class Watcher:
         self.reported: set[str] = set(self.state["reported"])
         self.printed: set[str] = set()
         self.events = 0
-        self.required: set[str] | None = None
-        self.prev_snapshot: list[tuple[str, str]] | None = None
-        self.pr_files: dict[str, set[str]] = {}
+        self.logged_gate = False
+        self.prev_snapshot: Any = None
+        self.empty_since: tuple[str, float] | None = None
 
     def load(self) -> Json | None:
         try:
@@ -295,77 +822,55 @@ class Watcher:
         self.save()
         sys.exit(code)
 
-    def fetch_pr(self) -> Json:
-        proc = gh([
-            "api", "graphql", "-f", f"query={QUERY}",
-            "-f", f"owner={self.owner}", "-f", f"name={self.name}", "-F", f"number={self.pr}",
-        ])
-        data = json.loads(proc.stdout)["data"]
-        pr = data["repository"]["pullRequest"]
-        pr["viewer"] = data["viewer"]["login"]
-        return pr
-
-    def fetch_checks(self) -> dict[str, Json]:
-        # gh pr checks exits 8 while checks are pending and 1 when one failed.
-        # Those are states, not errors: read the JSON and ignore the exit code.
-        proc = gh(["pr", "checks", str(self.pr), "-R", self.repo, "--json", "name,bucket,link,description"], allow=(0, 1, 8))
-        if not proc.stdout.strip():
-            if "no checks reported" in proc.stderr:
-                return {}
-            raise GhError(proc.stderr.strip() or f"gh pr checks exited {proc.returncode}", False)
-        checks: dict[str, Json] = {}
-        for row in json.loads(proc.stdout):
-            current = checks.get(row["name"])
-            if current is None or RANK.get(row["bucket"], 2) > RANK.get(current["bucket"], 2):
-                checks[row["name"]] = row
-        return checks
-
     def base_overlap(self, head: str, old: str, new: str) -> list[str]:
         """Files this PR touches that the new base commits also touch."""
         try:
-            if head not in self.pr_files:
-                self.pr_files[head] = set(gh_lines(["pr", "diff", str(self.pr), "-R", self.repo, "--name-only"]))
-            moved = gh_lines(["api", f"repos/{self.repo}/compare/{old}...{new}", "--jq", ".files[].filename"])
-        except GhError as error:
+            return sorted(self.host.pr_files(head).intersection(self.host.changed(old, new)))
+        except HostError as error:
             log(f"could not compare base commits: {error}")
             return []
-        return sorted(self.pr_files[head].intersection(moved))
+
+    def behind_count(self, base_oid: str | None, head: str) -> int | None:
+        if not base_oid:
+            return None
+        try:
+            return int(self.host.behind_by(base_oid, head))
+        except (HostError, ValueError):
+            return None
 
     def behind(self, base: str, base_oid: str | None, head: str) -> str:
         """How far the head is behind its base, for the green and ready lines."""
-        if not base_oid:
+        count = self.behind_count(base_oid, head)
+        if count is None:
             return ""
-        try:
-            count = gh(["api", f"repos/{self.repo}/compare/{base_oid}...{head}", "--jq", ".behind_by"]).stdout.strip()
-        except GhError:
-            return ""
-        return f"; {count} commit{'' if count == '1' else 's'} behind {base}"
+        return f"; {count} commit{'' if count == 1 else 's'} behind {base}"
 
     def poll(self) -> None:
-        pr = self.fetch_pr()
+        pr = self.host.snapshot()
         if pr["state"] == "MERGED":
             self.finish(0, [f"merged: {pr['url']}"])
         if pr["state"] == "CLOSED":
             self.finish(1, [f"closed without merging: {pr['url']}"])
 
-        base = pr["baseRefName"]
-        if self.required is None:
-            self.required = required_checks(self.repo, base)
-            gate = ", ".join(sorted(self.required)) or "none set, so every CI check gates"
-            log(f"watching {self.repo}#{self.pr} until {self.until}; required checks: {gate}")
-        checks = self.fetch_checks()
-        head = pr["headRefOid"]
+        base = pr["base"]
+        required: set[str] = pr["required"]
+        checks: dict[str, Json] = pr["checks"]
+        if not self.logged_gate:
+            self.logged_gate = True
+            gate_names = ", ".join(sorted(required)) or "none set, so every CI check gates"
+            log(f"watching {self.host.label} PR {pr['url']} until {self.until}; required checks: {gate_names}")
+        head = pr["head"]
         short = head[:7]
-        mine = {who(pr)[0], pr["viewer"]}
-        comments = pr["comments"]["nodes"]
-        reviews = pr["reviews"]["nodes"]
-        threads = pr["reviewThreads"]["nodes"]
+        mine = pr["mine"]
+        comments = pr["comments"]
+        reviews = pr["reviews"]
+        threads = pr["threads"]
         self.events = 0
 
         # Required checks. With no required checks configured, every CI check
         # gates except the review bots' own checks.
-        gate = self.required or {name for name in checks if not bot_name(name)}
-        label = "required check" if self.required else "check"
+        gate = required or {name for name in checks if not bot_name(name)}
+        label = "required check" if required else "check"
 
         def bucket(name: str) -> str:
             return checks[name]["bucket"] if name in checks else "pending"
@@ -376,38 +881,57 @@ class Watcher:
                 link = checks[name]["link"]
                 fail_lines.append(f"{label} failed: {name} {link}")
                 self.emit(f"fail:{head}:{name}:{link}", fail_lines[-1])
+        # A check that will not run until someone queues it (an expired or
+        # manual Azure DevOps build policy) needs action, not waiting.
+        action_lines: list[str] = []
+        for name in sorted(gate):
+            action = (checks.get(name) or {}).get("action")
+            if action:
+                action_lines.append(f"{label} needs action: {name}: {action} {checks[name]['link']}")
+                self.emit(f"action:{head}:{name}:{action}", action_lines[-1])
         watched = {name: c for name, c in checks.items() if bot_name(name) not in ADVISORY_BOTS}
-        gate_done = bool(gate) and all(bucket(n) != "pending" for n in gate)
+        # Azure DevOps repos without build policies or pipelines have no checks
+        # at all. Once a head has had none for a while, nothing is coming.
+        if self.host.allow_no_checks and not gate:
+            if not self.empty_since or self.empty_since[0] != head:
+                self.empty_since = (head, time.time())
+            no_checks = time.time() - self.empty_since[1] >= NO_CHECK_SECONDS
+        else:
+            self.empty_since, no_checks = None, False
+        gate_done = (bool(gate) and all(bucket(n) != "pending" for n in gate)) or no_checks
         all_done = gate_done and all(c["bucket"] != "pending" for c in watched.values())
         # Checks appear a few seconds after a push. Two identical polls in a row
         # guard against calling a half-registered set of checks finished.
-        snapshot = sorted((name, c["bucket"]) for name, c in watched.items())
+        snapshot = (head, sorted((name, c["bucket"]) for name, c in watched.items()))
         stable = snapshot == self.prev_snapshot
         self.prev_snapshot = snapshot
         green = gate_done and stable and not fail_lines
 
         # People and bots talking. Edits are never events.
         for comment in comments:
-            login, is_bot = who(comment)
-            if login in mine or bot_name(login) or (is_bot and any(b in login for b in STATUS_BOTS)):
+            login = comment["login"]
+            if comment["who"] in mine or bot_name(login) or (comment["is_bot"] and any(b in login.lower() for b in STATUS_BOTS)):
                 continue
             self.emit(f"c:{comment['id']}", f"comment from {login}: {snippet(comment['body'])} {comment['url']}")
         for review in reviews:
-            login, is_bot = who(review)
-            if login in mine or is_bot:
+            if review["who"] in mine or review["is_bot"]:
                 continue
             if review["state"] in ("APPROVED", "CHANGES_REQUESTED") or review["body"].strip():
                 state = review["state"].lower().replace("_", " ")
-                self.emit(f"c:{review['id']}", f"review from {login} ({state}): {snippet(review['body'])} {review['url']}")
+                text = snippet(review["body"])
+                self.emit(f"c:{review['id']}", f"review from {review['login']} ({state}){': ' + text if text else ''} {review['url']}")
         unresolved: list[str] = []
         for thread in threads:
-            nodes = thread["comments"]["nodes"]
-            if not thread["isResolved"] and nodes:
+            nodes = thread["comments"]
+            if not thread["resolved"] and nodes:
                 unresolved.append(nodes[0]["url"])
-            where = f"{thread['path']}:{thread['line']}" if thread["line"] else thread["path"]
+            path = thread["path"]
+            where = (f"{path}:{thread['line']}" if thread["line"] else path) if path else "the PR"
             for index, comment in enumerate(nodes):
-                login, _ = who(comment)
-                if login in mine:
+                login = comment["login"]
+                if comment["who"] in mine:
+                    continue
+                if index == 0 and comment["is_bot"] and any(b in login.lower() for b in STATUS_BOTS):
                     continue
                 kind = "new thread" if index == 0 else "thread reply"
                 self.emit(f"c:{comment['id']}", f"{kind} from {login} on {where}: {snippet(comment['body'])} {comment['url']}")
@@ -417,11 +941,12 @@ class Watcher:
         # summary names the head.
         bot_status: dict[str, str] = {}
         reviewed: list[str] = []
+        pending_bots: list[str] = []
         for bot in GATING_BOTS + ADVISORY_BOTS:
             own_checks = {name: c for name, c in checks.items() if bot_name(name) == bot}
-            summaries = [c for c in comments if bot_name(who(c)[0]) == bot]
-            own_reviews = [r for r in reviews if bot_name(who(r)[0]) == bot]
-            on_head = any((r.get("commit") or {}).get("oid") == head for r in own_reviews)
+            summaries = [c for c in pr["posts"] if bot_name(c["login"]) == bot]
+            own_reviews = [r for r in reviews if bot_name(r["login"]) == bot]
+            on_head = any(r.get("commit") == head for r in own_reviews)
             if own_checks:
                 done = all(c["bucket"] != "pending" for c in own_checks.values())
             else:
@@ -432,6 +957,8 @@ class Watcher:
                 bot_status[bot] = f"{bot} {desc['description'] or desc['bucket']} (advisory)"
             elif seen:
                 bot_status[bot] = f"{bot} {'done' if done else 'pending'}{' (advisory)' if bot in ADVISORY_BOTS else ''}"
+            if bot in GATING_BOTS and seen and not done:
+                pending_bots.append(bot)
             key = f"bot:{bot}:{head}"
             was_done = key in self.reported
             if done:
@@ -453,7 +980,7 @@ class Watcher:
                         self.emit(f"summary:{s['id']}:{new}", f"{bot} summary changed on {short}: {text} {s['url']}")
 
         # Base branch and merge state.
-        base_oid = ((pr.get("baseRef") or {}).get("target") or {}).get("oid")
+        base_oid = pr["base_oid"]
         old_base = self.state["base_oid"]
         if base_oid and old_base and base_oid != old_base and not self.baseline:
             touched = self.base_overlap(head, old_base, base_oid)
@@ -465,7 +992,7 @@ class Watcher:
                 )
         if base_oid:
             self.state["base_oid"] = base_oid
-        merge_state = pr["mergeStateStatus"]
+        merge_state = pr["merge_state"]
         dirty_line = f"merge state is DIRTY: the branch conflicts with {base}, rebase it"
         behind_line = f"merge state is BEHIND: update the branch from {base} before merging"
         if merge_state != "UNKNOWN":
@@ -479,14 +1006,16 @@ class Watcher:
         for c in watched.values():
             counts[c["bucket"]] = counts.get(c["bucket"], 0) + 1
         failed_names = sorted(name for name, c in watched.items() if c["bucket"] in FAILED)
+        no_bot = "no Greptile or Macroscope yet" if self.host.review_bot_required else ""
         parts = [
             ", ".join(f"{n} {b}" for b, n in sorted(counts.items()))
-            + (f" ({', '.join(failed_names)})" if failed_names else ""),
-            f"required {sum(bucket(n) in ('pass', 'skipping') for n in self.required)}/{len(self.required)} green"
-            if self.required
+            + (f" ({', '.join(failed_names)})" if failed_names else "")
+            or ("no checks" if no_checks else ""),
+            f"required {sum(bucket(n) in ('pass', 'skipping') for n in required)}/{len(required)} green"
+            if required
             else "",
-            ", ".join(bot_status[b] for b in GATING_BOTS + ADVISORY_BOTS if b in bot_status)
-            or "no Greptile or Macroscope yet",
+            ", ".join(bot_status[b] for b in GATING_BOTS + ADVISORY_BOTS if b in bot_status) or no_bot,
+            *pr["notes"],
             f"{len(unresolved)} unresolved threads",
             f"merge state {merge_state}",
         ]
@@ -500,17 +1029,32 @@ class Watcher:
                 self.finish(1, [dirty_line])
             if fail_lines:
                 self.finish(1, fail_lines)
+            if action_lines:
+                self.finish(1, action_lines)
             if green and self.until == "green":
                 self.reported.add(checks_key)
                 self.finish(0, [f"green on {short}: {summary}{self.behind(base, base_oid, head)}"])
-            # ready waits for Greptile or Macroscope, never for CodeRabbit.
-            if green and reviewed:
+            # ready waits for Greptile or Macroscope, never for CodeRabbit. On
+            # hosts where those bots are rare, it waits only for one that posted.
+            bots_ok = bool(reviewed) or (not self.host.review_bot_required and not pending_bots)
+            if green and bots_ok:
                 if unresolved:
                     self.finish(1, [f"blocked by {len(unresolved)} unresolved threads on {short}: {' '.join(unresolved)}"])
                 if merge_state == "BEHIND":
                     self.finish(1, [behind_line])
+                if self.host.reports_behind:
+                    note = self.behind(base, base_oid, head)
+                else:
+                    # Without a BEHIND state, ready needs a real count. A failed
+                    # lookup raises HostError, so the poll loop retries.
+                    if not base_oid:
+                        raise HostError(f"could not read the head of {base}", True)
+                    count = int(self.host.behind_by(base_oid, head))
+                    if count > 0:
+                        self.finish(1, [f"branch is {count} commit{'' if count == 1 else 's'} behind {base}: rebase it before merging"])
+                    note = f"; 0 commits behind {base}"
                 self.reported.add(checks_key)
-                self.finish(0, [f"ready on {short}: {summary}{self.behind(base, base_oid, head)}"])
+                self.finish(0, [f"ready on {short}: {summary}{note}"])
         if all_done and (stable or self.baseline):
             self.emit(checks_key, f"checks finished on {short}: {summary}")
         if self.until == "any-change" and self.events:
@@ -522,31 +1066,37 @@ class Watcher:
             try:
                 self.poll()
                 failures = 0
-            except GhError as error:
+            except HostError as error:
                 if not error.transient:
                     self.finish(1, [f"pr-wait stopped: {error}"])
                 failures += 1
                 log(f"poll failed ({failures}/{MAX_FAILED_POLLS}): {error}")
                 if failures >= MAX_FAILED_POLLS:
-                    self.finish(1, [f"pr-wait stopped: GitHub unreachable for {failures} polls: {error}"])
+                    self.finish(1, [f"pr-wait stopped: {self.host.label} unreachable for {failures} polls: {error}"])
             else:
                 self.save()
                 if self.baseline:
-                    log(f"baseline recorded for {self.repo}#{self.pr}; reporting only new events")
+                    log(f"baseline recorded for {self.host.key} PR {self.pr}; reporting only new events")
                 self.baseline = False
             time.sleep(self.interval)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="pr-wait", description="Watch a GitHub PR and print one line per real event.")
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles default to cp1252
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+    parser = argparse.ArgumentParser(prog="pr-wait", description="Watch a GitHub or Azure DevOps PR and print one line per real event.")
     parser.add_argument("pr", nargs="?", help="PR number or URL")
-    parser.add_argument("--repo", help="owner/name (default: from the URL or the current checkout)")
+    parser.add_argument("--repo", help="GitHub owner/name, or Azure DevOps org/project/repo or repo URL (default: the URL or origin)")
     parser.add_argument("--until", choices=("green", "ready", "any-change"), default="ready")
     parser.add_argument("--interval", type=int, default=20, help="seconds between polls (default 20, min 5)")
     args = parser.parse_args()
-    repo, pr = parse_target(args.pr, args.repo)
-    _lock = lock(repo, pr)
-    Watcher(repo, pr, args.until, max(args.interval, 5)).run()
+    host = parse_target(args.pr, args.repo)
+    watcher = Watcher(host, args.until, max(args.interval, 5))
+    _lock = lock(watcher.key)
+    watcher.run()
 
 
 if __name__ == "__main__":
